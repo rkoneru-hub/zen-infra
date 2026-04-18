@@ -1,7 +1,7 @@
 # ─── GitHub Actions OIDC Federation ─────────────────────────────────────────
 #
-# Allows GitHub Actions workflows in ravdy/zen-pharma-frontend and
-# ravdy/zen-pharma-backend to assume an IAM role without any long-lived
+# Allows GitHub Actions workflows in your-github-username/zen-pharma-frontend and
+# your-github-username/zen-pharma-backend to assume an IAM role without any long-lived
 # AWS credentials stored in GitHub Secrets.
 #
 # How it works:

@@ -28,55 +28,210 @@ This guide walks you through setting up the zen-pharma infrastructure on your ow
 
 ## 1. Architecture Overview
 
-This repository provisions a complete Kubernetes-based platform on AWS for the zen-pharma application. All infrastructure is managed by Terraform and deployed via GitHub Actions CI/CD.
+This repository provisions a complete Kubernetes-based platform on AWS for the zen-pharma
+application. All infrastructure is defined as code in Terraform and deployed automatically
+via GitHub Actions — no manual AWS console clicks required after initial setup.
 
-### What Gets Created
+---
 
-```
-AWS Account
-└── us-east-1
-    ├── VPC (10.0.0.0/16)
-    │   ├── Public Subnets       (10.0.1.0/24, 10.0.2.0/24)   — NAT Gateway, Load Balancers
-    │   ├── Private EKS Subnets  (10.0.3.0/24, 10.0.4.0/24)   — EKS worker nodes
-    │   └── Private RDS Subnets  (10.0.5.0/24, 10.0.6.0/24)   — RDS PostgreSQL
-    │
-    ├── EKS Cluster (pharma-dev-cluster)
-    │   └── Managed Node Group   — 3x t3.small (min: 2, max: 4)
-    │
-    ├── RDS PostgreSQL (pharma-dev-postgres)
-    │   └── db.t3.micro, 20GB, encrypted, private subnet only
-    │
-    ├── ECR Repositories
-    │   ├── api-gateway
-    │   ├── auth-service
-    │   ├── pharma-ui
-    │   ├── notification-service
-    │   └── drug-catalog-service
-    │
-    ├── IAM
-    │   ├── EKS cluster role
-    │   ├── EKS node group role
-    │   └── GitHub Actions OIDC role (for CI/CD — no static credentials)
-    │
-    └── Secrets Manager
-        ├── /pharma/dev/db-credentials
-        └── /pharma/dev/jwt-secret
-```
-
-### CI/CD Flow
+### AWS Resources Created by Terraform
 
 ```
-Feature branch
-    │
-    ▼
-Pull Request → terraform plan runs automatically
-    │
-    ▼
-Merge to main → terraform plan → Approval gate → terraform apply
-    │
-    ▼
+AWS Account (us-east-1)
+│
+├── S3 Bucket  (created manually — state backend for Terraform)
+│   └── zen-pharma-terraform-state-<your-username>
+│       ├── envs/dev/terraform.tfstate
+│       ├── envs/qa/terraform.tfstate
+│       └── envs/prod/terraform.tfstate
+│
+├── VPC  (10.0.0.0/16)
+│   ├── Public Subnets        10.0.1.0/24  (us-east-1a)  ]  NAT Gateway,
+│   │                         10.0.2.0/24  (us-east-1b)  ]  NLB, Ingress
+│   ├── Private EKS Subnets   10.0.3.0/24  (us-east-1a)  ]  EKS worker
+│   │                         10.0.4.0/24  (us-east-1b)  ]  nodes (private)
+│   └── Private RDS Subnets   10.0.5.0/24  (us-east-1a)  ]  RDS PostgreSQL
+│                             10.0.6.0/24  (us-east-1b)  ]  (private)
+│
+├── EKS Cluster  (pharma-dev-cluster, Kubernetes 1.33)
+│   ├── Managed Node Group
+│   │   ├── Instance type : t3.small
+│   │   ├── Desired       : 3 nodes
+│   │   ├── Min / Max     : 1 / 4
+│   │   └── Subnets       : private EKS subnets (no public IP)
+│   └── OIDC Provider
+│       └── Enables IRSA — pods assume IAM roles without static credentials
+│
+├── RDS PostgreSQL  (pharma-dev-postgres)
+│   ├── Engine        : PostgreSQL 15.7
+│   ├── Instance      : db.t3.micro
+│   ├── Storage       : 20 GB gp2, encrypted
+│   ├── Access        : private subnet only, port 5432 from EKS SG only
+│   └── DB name       : pharmadb  /  Master user: pharmaadmin
+│
+├── ECR Repositories  (8 repos, one per service)
+│   ├── api-gateway               (Spring Cloud Gateway, port 8080)
+│   ├── auth-service              (JWT auth, port 8081)
+│   ├── drug-catalog-service      (drug catalogue, port 8082)
+│   ├── inventory-service         (stock management, port 8083)
+│   ├── supplier-service          (vendor management, port 8084)
+│   ├── manufacturing-service     (batch tracking, port 8085)
+│   ├── notification-service      (Node.js, port 3000)
+│   └── pharma-ui                 (React frontend, port 80)
+│   │
+│   └── Each repo has:
+│       ├── scan_on_push = true   (automatic CVE scan on every push)
+│       └── Lifecycle policy      (keep last 10 images, expire older ones)
+│
+├── IAM
+│   ├── EKS Cluster Role          (allows EKS control plane to manage AWS resources)
+│   ├── EKS Node Group Role       (allows worker nodes to pull from ECR, join cluster)
+│   │
+│   ├── GitHub Actions OIDC Role  (pharma-dev-gitlab-runner-role)
+│   │   ├── Trust policy : repo zen-pharma-frontend and zen-pharma-backend only
+│   │   └── Permissions  : ECR push/pull, EKS describe
+│   │   └── How it works : GitHub OIDC token -> AWS STS -> short-lived credentials
+│   │                      No AWS_ACCESS_KEY_ID stored in GitHub
+│   │
+│   ├── ESO IRSA Role             (pharma-dev-eso-role)
+│   │   ├── Trust policy : EKS service account external-secrets/external-secrets
+│   │   └── Permissions  : secretsmanager:GetSecretValue on /pharma/* paths only
+│   │
+│   └── ArgoCD IRSA Role          (pharma-dev-argocd-role)
+│       └── Trust policy : EKS service account argocd/argocd-application-controller
+│
+└── AWS Secrets Manager
+    ├── /pharma/dev/db-credentials   {"username": "pharmaadmin", "password": "..."}
+    └── /pharma/dev/jwt-secret       {"secret": "..."}
+```
+
+---
+
+### Terraform Module Structure
+
+```
+zen-infra/
+├── envs/
+│   ├── dev/    <-- calls all modules with dev-specific values
+│   ├── qa/     <-- same modules, different sizing
+│   └── prod/   <-- same modules, production sizing + HA settings
+│
+└── modules/
+    ├── vpc/            creates VPC, subnets, IGW, NAT GW, route tables
+    ├── eks/            creates EKS cluster, node group, OIDC provider
+    ├── rds/            creates RDS instance, subnet group, security group
+    ├── ecr/            creates ECR repos with lifecycle policies
+    ├── iam/            creates OIDC roles for GitHub Actions, ESO, ArgoCD
+    └── secrets-manager/ stores DB password and JWT secret in Secrets Manager
+```
+
+Each environment directory (`envs/dev`) calls the modules like functions:
+
+```
+envs/dev/main.tf
+    |
+    |-- module "vpc"              --> modules/vpc/
+    |-- module "eks"              --> modules/eks/   (depends on vpc outputs)
+    |-- module "rds"              --> modules/rds/   (depends on vpc + eks outputs)
+    |-- module "ecr"              --> modules/ecr/
+    |-- module "iam"              --> modules/iam/   (depends on eks OIDC outputs)
+    └-- module "secrets_manager"  --> modules/secrets-manager/
+```
+
+Modules share data via outputs — for example, `module.eks.oidc_provider_arn` is passed
+into `module.iam` so the IAM trust policy references the exact OIDC provider created
+for this cluster, not a hardcoded ARN.
+
+---
+
+### Network Traffic Flow
+
+```
+Internet
+    |
+    v
+AWS Network Load Balancer  (created by NGINX Ingress Controller Helm chart)
+    |  routes by URL path
+    |-- /          -->  pharma-ui       (React, port 80)
+    |-- /api/*     -->  api-gateway     (port 8080)
+                           |
+                           |-- /api/auth/*          --> auth-service        (8081)
+                           |-- /api/catalog/*       --> drug-catalog-svc    (8082)
+                           |-- /api/inventory/*     --> inventory-service   (8083)
+                           |-- /api/suppliers/*     --> supplier-service    (8084)
+                           |-- /api/manufacturing/* --> manufacturing-svc   (8085)
+                           └-- /api/notifications/* --> notification-svc    (3000)
+                                                            |
+                                                    All backend services
+                                                    pull secrets from
+                                                    AWS Secrets Manager
+                                                    via ESO (no passwords
+                                                    in pod spec or config)
+                                                            |
+                                                            v
+                                               RDS PostgreSQL (private subnet)
+```
+
+---
+
+### GitHub Actions CI/CD Flow for Infrastructure
+
+```
+Developer creates feature branch in zen-infra
+    |
+    v
+git push origin feature/my-change
+    |
+    v
+Open Pull Request  -->  zen-infra GitHub Actions runs automatically:
+    |
+    |   [Terraform Plan job]
+    |   1. Checkout code
+    |   2. Setup Terraform 1.10.0
+    |   3. Configure AWS credentials  (static IAM keys from GitHub Secrets)
+    |   4. terraform fmt -check       --> fails if code is not formatted
+    |   5. terraform init             --> connects to S3 backend, downloads providers
+    |   6. terraform validate         --> syntax and logic check
+    |   7. terraform plan             --> shows what will change (saved as artifact)
+    |
+    |   Plan output is visible in the Actions tab. PR is blocked if plan fails.
+    |
+    v
+PR reviewed and merged to main
+    |
+    v
+[Terraform Plan job runs again on main - fresh plan]
+    |
+    v
+[Terraform Apply job - PAUSES for manual approval]
+    |
+    |   Go to: Actions --> running workflow --> "Review deployments" --> Approve
+    |
+    v
+[Terraform Apply runs]
+    |   8. terraform apply tfplan     --> provisions/updates AWS resources
+    |      (takes 15-25 min for EKS + RDS)
+    |
+    v
 Infrastructure updated in AWS
+    |
+    v
+EKS cluster is ready for Stage 2 (install NGINX Ingress, ArgoCD, ESO)
 ```
+
+---
+
+### Security Design Decisions
+
+| Decision | Why |
+|---|---|
+| Worker nodes in private subnets | Nodes not reachable from internet; only NLB is public |
+| RDS in private subnets | Database never exposed to internet; only EKS nodes can connect (port 5432 via SG rule) |
+| No static AWS keys in GitHub CI | GitHub Actions uses OIDC; credentials are short-lived (1 hour) and scoped to specific repos |
+| IRSA for pods | Pods never hold AWS credentials; they exchange a projected K8s token for short-lived STS credentials |
+| Secrets Manager (not ConfigMap) | DB passwords and JWT secret never live in Git or Kubernetes config; ESO syncs them at runtime |
+| ECR scan on push | Every image is automatically scanned for CVEs when pushed; results visible in ECR console |
+| S3 state with versioning | Terraform state is versioned — accidental corruption can be rolled back |
 
 ---
 
@@ -233,7 +388,7 @@ aws s3 ls s3://zen-pharma-terraform-state-YOUR-GITHUB-USERNAME
 
 ### 6.1 Fork the Repository
 
-1. Go to `github.com/ravdy/zen-infra`
+1. Go to `github.com/your-github-username/zen-infra`
 2. Click **Fork** (top right)
 3. Select your account as the destination
 4. Clone your fork locally:
